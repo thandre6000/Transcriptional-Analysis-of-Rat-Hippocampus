@@ -1,0 +1,510 @@
+---
+title: "Wang_Integration_Clusters"
+author: "Erika Mehrhoff"
+date: "2024-08-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(DGEobj.utils)
+#BiocManager::install("biomaRt")
+library(biomaRt)
+```
+
+Import single cell matrices, make merged seurat object, and look at unintegrated UMAP
+```{r}
+mat7 <- ReadMtx("matrix7.mtx", cells="barcodes7.tsv", features="genes7.tsv")
+mat1 <- ReadMtx("matrix1.mtx", cells="barcodes1.tsv", features="genes1.tsv")
+
+seu1 <- CreateSeuratObject(mat1, project="HP1")
+seu7 <- CreateSeuratObject(mat7, project="HP7")
+
+# START HERE #
+com <- merge(x=seu1, y = seu7,add.cell.ids = c("hp1", "hp7"), project = "comb")
+
+com <- NormalizeData(com)
+ com <- FindVariableFeatures(com)
+ com <- ScaleData(com)
+ com <- RunPCA(com)
+ com <- FindNeighbors(com, dims = 1:30, reduction = "pca")
+ com <- FindClusters(com, resolution = 2, cluster.name = "unintegrated_clusters")
+com <- RunUMAP(com, dims = 1:30, reduction = "pca", reduction.name = "umap.unintegrated")
+
+png(filename="umap_not_integrated2.png", width = 700, height = 250)
+DimPlot(com, reduction = "umap.unintegrated", group.by = c("orig.ident", "seurat_clusters"))
+dev.off()
+```
+
+Perform integration and make new UMAP
+```{r}
+com <- IntegrateLayers(object = com, method = CCAIntegration, orig.reduction= "pca", new.reduction = "integrated.cca",verbose = FALSE)
+ com[["RNA"]] <- JoinLayers(com[["RNA"]])
+ com <- FindNeighbors(com, reduction = "integrated.cca", dims = 1:30)
+ com <- FindClusters(com, resolution = .05)
+com <- RunUMAP(com, dims = 1:30, reduction = "integrated.cca")
+
+png(filename="umap_integrated_res.05.png", width = 700, height = 250)
+DimPlot(com, reduction = "umap", group.by = c("orig.ident", "seurat_clusters"))
+dev.off()
+
+# END HERE #
+```
+
+
+
+
+Get count data from integrated seurat object and cluster info
+```{r}
+# raw count data
+com <- readRDS("combined_seu_obj_integrated_res.05.rds")
+count <-com[["RNA"]]$counts
+#22133 genes 26029 cells
+
+write.csv(count, "wang_raw_integrated_seucount.csv")
+
+
+#cell cluster assignments
+cluster <- com[[c("orig.ident","seurat_clusters")]]
+write.csv(cluster, "wang_clusters.csv")
+```
+
+Filter and normalize
+```{r}
+count <- read.csv("singlecell/wang_raw_integrated_seucount.csv")
+#22133 genes
+
+filtered <- count[rowSums(count[,c(2:ncol(count))]) > 1,]
+# 20636 genes
+
+filtered <- count[rowSums(count[,c(2:ncol(count))]) > 10,]
+# 17309
+
+filtered <- count[rowSums(count[,c(2:ncol(count))]) > 100,]
+# 13445
+
+filtered <- count[rowSums(count[,-1]>20)>((ncol(count)-1)*0.5),]
+#1?
+
+# use this filter
+filtered <- count[rowSums(count[,c(2:ncol(count))]) > 10,]
+# 17309
+
+
+write.csv(cpm, "wang_cpm_integrated_filtered.csv")
+
+
+#filtered <- count[,colSums(count[c(1:nrow(count)),]) > 1]
+
+```
+
+Bring in cluster info and collapse cell types
+```{r}
+cluster <- read.csv("singlecell/wang_clusters.csv")
+
+table(cluster$seurat_clusters)
+# 0     1     2     3     4     5     6 
+#13828  4407  2385  2188  2093  1012   116 
+
+cluster$seurat_clusters <- as.factor(cluster$seurat_clusters)
+cluster <- filter(cluster,seurat_clusters!="6") #25913
+cluster$collapsed_cluster <- ifelse(cluster$seurat_clusters=="1", "Oligodendrocytes",ifelse(cluster$seurat_clusters=="4", "Microglia",ifelse(cluster$seurat_clusters=="3","Choroid Plexus", ifelse(cluster$seurat_clusters=="5", "Astrocytes", "Neurons"))))
+
+write.csv(cluster, "wang_clusters_no6_collapsed.csv")
+
+```
+
+Assign cell types to clusters
+```{r}
+# use seurat object
+com <- readRDS("combined_seu_obj_integrated_res.05.rds")
+
+#Markers used in the paper:
+#Neurons-Syt1 and NeuN/Rbfox3 ( ENSRNOG00000006426 and ENSRNOG00000003386) 0 and 2
+#Oligodendrocytes- Cldn11 ( ENSRNOG00000010263) 1
+#Microglia- Tmem176b (ENSRNOG00000008465 ) Fcrl2 16164; Trem2 13578; C1qa 12807 4
+#choroid plexus cells- Vcan ( ENSRNOG00000029212) 3
+#astrocytes-Gja1 ( ENSRNOG00000000805) 5
+
+#png(filename="celltype_markers_wang.png", width = 600, height = 400)
+#FeaturePlot(com, features = c("Syt1", "Rbfox3", "Cldn11", "Tmem176b", "Vcan", "Gja1"))
+#dev.off()
+
+
+plot <- FeaturePlot(com, features = c("Syt1", "Rbfox3", "Cldn11", "Tmem176b", "Vcan", "Gja1"), reduction = "umap")
+ggsave(filename = "celltype_markers_wang.jpg", height = 7, width = 10, plot = plot, quality = 50)
+```
+
+
+Take filtered counts and get rid of cells in cluster 6
+```{r}
+rownames(filtered) <- filtered$X #use filtered low read
+filtered2 <- filtered[,colnames(filtered) %in% cluster$X] # get rid of cluster 6
+filtered2 <- as.matrix(filtered2)
+cpm <- convertCounts(filtered2, unit="CPM") # cpm
+
+write.csv(cpm, "wang_filtered_no6_cpm.csv")
+```
+
+Attach cell type to cpm matrix and export for cibersort
+```{r}
+# use shorthand names
+cluster$short_cluster <- ifelse(cluster$seurat_clusters=="1", "O",ifelse(cluster$seurat_clusters=="4", "M",ifelse(cluster$seurat_clusters=="3","C", ifelse(cluster$seurat_clusters=="5", "A", "N"))))
+
+cluster <- cluster[, c(1,5)]
+
+all(cluster$X==colnames(cpm))
+
+cluster <- t(cluster)
+colnames(cluster) <- cluster[1,]
+
+cpm <- rbind(cpm, cluster)
+cpm <- cpm[c(17310,17311,1:17309),]
+
+write.csv(cpm, "wang_filtered_no6_cpm_withcelltype.csv")
+```
+
+
+Remake cluster plot with neurons collapsed with cluster 6 removed
+```{r}
+# add column to seurat object with new clusters
+com <- readRDS("singlecell/combined_seu_obj_integrated_res.05.rds")
+
+com2 <-subset(com, subset=seurat_clusters!="6")
+# 22133 25913
+
+cluster <- read.csv("wang_clusters_no6_collapsed.csv")
+com3 <- com2[rownames(com2) %in% cluster$collapsed_cluster,]
+#rownames(com2)
+
+
+com2$short_cluster <- ifelse(cluster$seurat_clusters=="1", "Oligodendrocytes",ifelse(cluster$seurat_clusters=="4", "Microglia",ifelse(cluster$seurat_clusters=="3","Choroid Plexus", ifelse(cluster$seurat_clusters=="5", "Astrocytes", "Neurons"))))
+
+#haven't gotten to work yet
+plot <- DimPlot(com, reduction = "umap", group.by = c("short_cluster"))
+ggsave(filename = "celltype_markers_wang_5.jpg", height = 7, width = 10, plot = plot, quality = 50)
+
+```
+
+
+```{r}
+com <- read.csv("singlecell/wang_raw_integrated_seucount.csv")
+#22133 genes
+
+com <- com[rowSums(com[,c(2:ncol(com))]) > 10,]
+rownames(com) <- com$X
+cluster <- read.csv("wang_clusters_no6_collapsed.csv")
+com3 <- com[,colnames(com)%in% cluster$X]
+
+write.csv(com3, "wang_raw_integrated_filtered_no6.csv")
+
+
+com <- com3
+com <- CreateSeuratObject(com)
+
+com <- NormalizeData(com)
+ com <- FindVariableFeatures(com)
+ com <- ScaleData(com)
+ com <- RunPCA(com)
+ com <- FindNeighbors(com, dims = 1:30, reduction = "pca")
+ com <- FindClusters(com, resolution = .05, cluster.name = "seurat_clusters")
+com <- RunUMAP(com, dims = 1:30, reduction = "pca", reduction.name = "umap")
+
+
+plot <- DimPlot(com, reduction = "umap",group.by = c("seurat_clusters"))
+ggsave(filename = "umap_integrated_filtered_no6.jpg", height = 7, width = 10, plot = plot, quality = 50)
+```
+
+change genesymbol to ensembl id
+```{r}
+df <- read.csv("wang_filtered_no6_cpm_withcelltype.csv")
+df2 <- df[c(1:2),]
+df <- df[-1,]
+df <- df[-1,]
+
+ensembl <- useEnsembl(biomart="ensembl",dataset = "rnorvegicus_gene_ensembl")
+get_anno <- getBM(attributes=c("ensembl_gene_id",
+                              "ensembl_transcript_id",
+                              "external_gene_name",
+                              "description",
+                              "gene_biotype"),
+                  # might want to try transcript df
+                 mart = ensembl)
+get_anno <- get_anno[,c(1,3)]
+colnames(get_anno)[2] <- "X"
+get_anno2 <-  get_anno[!(get_anno$X==""), ]
+
+write.csv(df2, "singlecell/cell_type_rows.csv")
+write.csv(df, "singlecell/matrix_for_ensembl.csv")
+write.csv(get_anno2, "singlecell/ensembl_wang.csv")
+
+# put on cluster to merge
+#scp cell_type_rows.csv erme3555@login.rc.colorado.edu:/scratch/alpine/erme3555/seurat_single/Wang_raw_data/
+#scp matrix_for_ensembl.csv erme3555@login.rc.colorado.edu:/scratch/alpine/erme3555/seurat_single/Wang_raw_data/
+#scp ensembl_wang.csv erme3555@login.rc.colorado.dedu:/scratch/alpine/erme3555/seurat_single/Wang_raw_data/
+
+df2<- read.csv("cell_type_rows.csv")
+df <- read.csv("matrix_for_ensembl.csv") 
+get_anno2 <- read.csv("ensembl_wang.csv")
+
+# > sum(duplicated(get_anno2))
+# 23217
+get_anno2 <- get_anno2[!duplicated(get_anno2), ]
+# 26195
+
+
+df3 <- merge(df,get_anno2, by="X") 
+# 14317 25915
+
+write.csv(df3,"wang_ensembl_converted_filtered_no6_cpm.csv")
+
+write.csv(df4,"wang_cibersort_ready.csv")
+
+
+```
+
+Cell proportion bar graph
+```{r}
+per <- read.csv("singlecell/wang_proportions_UPDATED.csv")
+
+per <- per[,c(1:6)]
+
+df <- read.csv(file= "data/sample_sheet.csv", header=T) #56
+
+# make these variables factors (will explain later)
+df$exercise <- as.factor(df$exercise)
+df$alcohol <- as.factor(df$alcohol)
+df$sex <- as.factor(df$sex)
+df <- droplevels(filter(df, exercise!="cage_control"))
+df <- filter(df, ID!="A21104")
+df <- filter(df, ID!="A21108")
+df <- filter(df, ID!="A21111")
+df <- filter(df, ID!="A21112")
+df <- filter(df, ID!="A2181")
+
+df$Group <- paste(df$alcohol,"_",df$exercise)
+per$ID <-per$Mixture
+per <- per[,-1]
+
+
+per <- merge(df, per, by="ID")
+
+per$Group <- as.factor(per$Group)
+
+# split by group
+c_s <- filter(per, Group=="control _ sedentary")
+c_e <- filter(per, Group=="control _ exercise")
+b_s <- filter(per, Group=="binge _ sedentary")
+b_e <- filter(per, Group=="binge _ exercise")
+
+
+# take column means
+cs2 <- data.frame(Neurons=mean(c_s[,6]), Microglia=mean(c_s[,7]),Choroid_Plexus=mean(c_s[,8]),Oligodendrocytes=mean(c_s[,9]),Astrocytes=mean(c_s[,10]), Group="Control_Sedentary")
+ce2 <- data.frame(Neurons=mean(c_e[,6]), Microglia=mean(c_e[,7]),Choroid_Plexus=mean(c_e[,8]),Oligodendrocytes=mean(c_e[,9]),Astrocytes=mean(c_e[,10]), Group="Control_Exercise")
+bs2 <- data.frame(Neurons=mean(b_s[,6]), Microglia=mean(b_s[,7]),Choroid_Plexus=mean(b_s[,8]),Oligodendrocytes=mean(b_s[,9]),Astrocytes=mean(b_s[,10]), Group="Binge_Sedentary")
+be2 <- data.frame(Neurons=mean(b_e[,6]), Microglia=mean(b_e[,7]),Choroid_Plexus=mean(b_e[,8]),Oligodendrocytes=mean(b_e[,9]),Astrocytes=mean(b_e[,10]), Group="Binge_Exercise")
+
+
+
+per2 <- rbind(cs2, ce2)
+per2 <- rbind(per2, bs2)
+per2 <- rbind(per2, be2)
+
+per3 <- pivot_longer(per2, cols=c(1:5), names_to="CellType", values_to="Proportion")
+
+
+bar <- ggplot(per3, aes(fill=CellType, y=Proportion, x=Group)) + 
+  geom_bar(position="stack", stat="identity") + labs(
+       title= "Estimated Proportion of Cell Types by Group") +  theme_classic() + 
+       theme(axis.text=element_text(size=12), #change font size of axis text
+      axis.title=element_text(size=20), #change font size of axis titles
+      plot.title=element_text(size=20), #change font size of plot title
+      legend.text=element_text(size=12), #change font size of legend text
+      legend.title=element_text(size=20)) + theme(axis.text.x = element_text(angle = 30, hjust = 0.5, vjust = 0.5))
+bar
+ggsave("~/Documents/Ehringer Lab /Alcohol Excerise RNASeq/Alc_Ex_code/singlecell/proportions_wang_UPDATED.png", bar)
+
+```
+
+Table
+```{r}
+per2 <- per2[,c(6,1:5)]
+tab <- per2 %>%
+  kbl() %>%
+  kable_styling()
+
+
+
+tab <- per2 %>%
+  kbl() %>%
+  kable_styling()
+save_kable(tab, "singlecell/wang_proportion_table_UPDATED.png", density = 500)
+
+```
+
+
+
+Proportion ANOVA
+```{r}
+aov1 <- aov(N ~ alcohol*exercise, data = per)
+summary(aov1)
+
+aov2 <- aov(A ~ alcohol*exercise, data = per)
+summary(aov2) # new interaction
+
+aov3 <- aov(M ~ alcohol*exercise, data = per)
+summary(aov3) 
+
+aov4 <- aov(C ~ alcohol*exercise, data = per)
+summary(aov4) 
+
+aov5 <- aov(O ~ alcohol*exercise, data = per)
+summary(aov5)
+
+```
+
+
+Group expression heatmaps
+```{r}
+# one heatmap for each cell type
+cs <- read_delim("~/Documents/Ehringer Lab /Alcohol Excerise RNASeq/Alc_Ex_code/singlecell/CIBERSORTx_Job59_output/CIBERSORTxGEP_Job59_GEPs_Filtered.txt", delim = "\t")
+ce <- read_delim("~/Documents/Ehringer Lab /Alcohol Excerise RNASeq/Alc_Ex_code/singlecell/CIBERSORTx_Job57_output/CIBERSORTxGEP_Job57_GEPs_Filtered.txt", delim = "\t")
+bs <- read_delim("~/Documents/Ehringer Lab /Alcohol Excerise RNASeq/Alc_Ex_code/singlecell/CIBERSORTx_Job56_output/CIBERSORTxGEP_Job56_GEPs_Filtered.txt", delim = "\t")
+be <- read_delim("~/Documents/Ehringer Lab /Alcohol Excerise RNASeq/Alc_Ex_code/singlecell/CIBERSORTx_Job55_output/CIBERSORTxGEP_Job55_GEPs_Filtered.txt", delim = "\t")
+
+# cell A
+cellA <- as.data.frame(cbind(cs$GeneSymbol , cs$N, ce$N, bs$N, be$N))
+rownames(cellA) <- cellA$V1
+cellA <- cellA[,-1]
+colnames(cellA) <- c("Control_Sedentary","Control_Exercise", "Binge_Sedentary","Binge_Exercise")
+cellA$Control_Sedentary <- as.numeric(cellA$Control_Sedentary)
+cellA$Control_Exercise <- as.numeric(cellA$Control_Exercise)
+cellA$Binge_Sedentary <- as.numeric(cellA$Binge_Sedentary)
+cellA$Binge_Exercise <- as.numeric(cellA$Binge_Exercise)
+cellA2 <- as.data.frame(cellA)
+
+
+woNA <-cellA2[rowSums(is.na(cellA2)) != ncol(cellA2), ]
+woNA2 <-woNA[rowSums(is.na(woNA)) != 3, ]
+woNA3 <-woNA2[rowSums(is.na(woNA2)) != 2, ]
+woNA4 <- woNA3[rowSums(woNA3, na.rm=T) >= 1,] # 3877
+
+#ind <- apply(wo0, 1, function(x) all(is.na(x)))
+#woNA <- wo0[ !ind, ]
+
+library(ComplexHeatmap)
+heatmap(as.matrix(woNA4), na_col = "gray", clustering_method_rows="single", main="Neurons")
+
+pdf("~/Documents/Ehringer Lab /Alcohol Excerise RNASeq/Alc_Ex_code/singlecell/neuron_heatmap_updated.pdf", width=12, height=16)
+heatmap(as.matrix(woNA4), na_col = "gray", clustering_method_rows="single", main="Neurons")
+dev.off()
+
+# cell B
+cellB <- as.data.frame(cbind(cs$GeneSymbol , cs$A, ce$A, bs$A, be$A))
+rownames(cellB) <- cellB$V1
+cellB <- cellB[,-1]
+colnames(cellB) <- c("Control_Sedentary","Control_Exercise", "Binge_Sedentary","Binge_Exercise")
+cellB$Control_Sedentary <- as.numeric(cellB$Control_Sedentary)
+cellB$Control_Exercise <- as.numeric(cellB$Control_Exercise)
+cellB$Binge_Sedentary <- as.numeric(cellB$Binge_Sedentary)
+cellB$Binge_Exercise <- as.numeric(cellB$Binge_Exercise)
+cellB2 <- as.data.frame(cellB)
+
+
+woNA <-cellB2[rowSums(is.na(cellB2)) != ncol(cellB2), ]
+woNA2 <-woNA[rowSums(is.na(woNA)) != 3, ]
+woNA3 <-woNA2[rowSums(is.na(woNA2)) != 2, ]
+woNA4 <- woNA3[rowSums(woNA3, na.rm=T) >= 1,] # 154
+
+#ind <- apply(wo0, 1, function(x) all(is.na(x)))
+#woNA <- wo0[ !ind, ]
+
+library(ComplexHeatmap)
+heatmap(as.matrix(woNA4), na_col = "gray", clustering_method_rows="single", main="Astrocytes")
+
+pdf("~/Documents/Ehringer Lab /Alcohol Excerise RNASeq/Alc_Ex_code/singlecell/astrocyte_heatmap_updated.pdf", width=12, height=16)
+heatmap(as.matrix(woNA4), na_col = "gray", clustering_method_rows="single", main="Astrocytes")
+dev.off()
+
+# cell C
+cellC <- as.data.frame(cbind(cs$GeneSymbol , cs$M, ce$M, bs$M, be$M))
+rownames(cellC) <- cellC$V1
+cellC <- cellC[,-1]
+colnames(cellC) <- c("Control_Sedentary","Control_Exercise", "Binge_Sedentary","Binge_Exercise")
+cellC$Control_Sedentary <- as.numeric(cellC$Control_Sedentary)
+cellC$Control_Exercise <- as.numeric(cellC$Control_Exercise)
+cellC$Binge_Sedentary <- as.numeric(cellC$Binge_Sedentary)
+cellC$Binge_Exercise <- as.numeric(cellC$Binge_Exercise)
+cellC2 <- as.data.frame(cellC)
+
+
+woNA <-cellC2[rowSums(is.na(cellC2)) != ncol(cellC2), ]
+woNA2 <-woNA[rowSums(is.na(woNA)) != 3, ]
+woNA3 <-woNA2[rowSums(is.na(woNA2)) != 2, ]
+woNA4 <- woNA3[rowSums(woNA3, na.rm=T) >= 1,] # 1066
+
+#ind <- apply(wo0, 1, function(x) all(is.na(x)))
+#woNA <- wo0[ !ind, ]
+
+library(ComplexHeatmap)
+heatmap(as.matrix(woNA3), na_col = "gray", clustering_method_rows="single", main="Microglia")
+
+pdf("~/Documents/Ehringer Lab /Alcohol Excerise RNASeq/Alc_Ex_code/singlecell/microglia_heatmap_updated.pdf", width=12, height=16)
+heatmap(as.matrix(woNA4), na_col = "gray", clustering_method_rows="single", main="Microglia") 
+dev.off()
+
+# cell D
+cellD <- as.data.frame(cbind(cs$GeneSymbol , cs$C, ce$C, bs$C, be$C))
+rownames(cellD) <- cellD$V1
+cellD <- cellD[,-1]
+colnames(cellD) <- c("Control_Sedentary","Control_Exercise", "Binge_Sedentary","Binge_Exercise")
+cellD$Control_Sedentary <- as.numeric(cellD$Control_Sedentary)
+cellD$Control_Exercise <- as.numeric(cellD$Control_Exercise)
+cellD$Binge_Sedentary <- as.numeric(cellD$Binge_Sedentary)
+cellD$Binge_Exercise <- as.numeric(cellD$Binge_Exercise)
+cellD2 <- as.data.frame(cellD)
+
+
+woNA <-cellD2[rowSums(is.na(cellD2)) != ncol(cellD2), ]
+woNA2 <-woNA[rowSums(is.na(woNA)) != 3, ]
+woNA3 <-woNA2[rowSums(is.na(woNA2)) != 2, ]
+woNA4 <- woNA3[rowSums(woNA3, na.rm=T) >= 1,] # 1463
+
+#ind <- apply(wo0, 1, function(x) all(is.na(x)))
+#woNA <- wo0[ !ind, ]
+
+library(ComplexHeatmap)
+heatmap(as.matrix(woNA4), na_col = "gray", clustering_method_rows="single", main="Choroid Plexus")
+
+pdf("~/Documents/Ehringer Lab /Alcohol Excerise RNASeq/Alc_Ex_code/singlecell/choroid_plexus_heatmap_updated.pdf", width=12, height=16)
+heatmap(as.matrix(woNA4), na_col = "gray", clustering_method_rows="single", main="Choroid Plexus") 
+dev.off()
+
+# cell E
+cellE <- as.data.frame(cbind(cs$GeneSymbol , cs$O, ce$O, bs$O, be$O))
+rownames(cellE) <- cellE$V1
+cellE <- cellE[,-1]
+colnames(cellE) <- c("Control_Sedentary","Control_Exercise", "Binge_Sedentary","Binge_Exercise")
+cellE$Control_Sedentary <- as.numeric(cellE$Control_Sedentary)
+cellE$Control_Exercise <- as.numeric(cellE$Control_Exercise)
+cellE$Binge_Sedentary <- as.numeric(cellE$Binge_Sedentary)
+cellE$Binge_Exercise <- as.numeric(cellE$Binge_Exercise)
+cellE2 <- as.data.frame(cellE)
+
+
+woNA <-cellE2[rowSums(is.na(cellE2)) != ncol(cellE2), ]
+woNA2 <-woNA[rowSums(is.na(woNA)) != 3, ]
+woNA3 <-woNA2[rowSums(is.na(woNA2)) != 2, ]
+woNA4 <- woNA3[rowSums(woNA3, na.rm=T) >= 1,] # 2302
+
+#ind <- apply(wo0, 1, function(x) all(is.na(x)))
+#woNA <- wo0[ !ind, ]
+
+library(ComplexHeatmap)
+heatmap(as.matrix(woNA4), na_col = "gray", clustering_method_rows="single", main="Oligodendrocytes")
+
+pdf("~/Documents/Ehringer Lab /Alcohol Excerise RNASeq/Alc_Ex_code/singlecell/oligodendrocytes_heatmap_updated.pdf", width=12, height=16)
+heatmap(as.matrix(woNA4), na_col = "gray", clustering_method_rows="single", main="Oligodendrocytes") 
+dev.off()
+```
+

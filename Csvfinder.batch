@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# Define the directory where your gzipped FASTQ files and subdirectories are located
+search_directory="/path/to/your/data/directory"
+
+# Define the CSV file where you want to store the names
+csv_file="file_list.csv"
+
+# Use find to locate all gzipped FASTQ files in the specified directory and its subdirectories
+# Then use awk to extract the file names
+find "$search_directory" -type f -name "*.fq.gz" | awk -F/ '{print $NF}' > "$csv_file"
+
+# Print a message indicating the process is complete
+echo "Gzipped FASTQ file names extracted and saved to $csv_file"
